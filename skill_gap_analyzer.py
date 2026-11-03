@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import re
 import json
+import logging
 import numpy as np
 import pandas as pd
 from collections import Counter
@@ -23,7 +24,11 @@ sys.path.insert(0, str(acadlink_src))
 
 from acadlink_skill_gap.src.paths import PROCESSED_DIR, DATA_DIR
 from acadlink_skill_gap.src.ontology.skills import build_canonical_skills, SkillMatcher
-from acadlink_skill_gap.src.preprocessing.text_norm import normalize_text
+from acadlink_skill_gap.src.preprocessing.text_norm import normalize_text, ABBREVIATIONS
+
+DEFAULT_NEURAL_CHECKPOINT = (project_root / "acadlink_skill_gap" / "models" /
+                             "neural_baseline" / "full_v1" / "best_model.pt")
+logger = logging.getLogger(__name__)
 
 
 def detect_resume_format(resume_path: str) -> str:
@@ -74,19 +79,175 @@ def extract_text_from_docx(docx_path: str) -> str:
 class SkillGapAnalyzer:
     """Analyzes skill gaps between a resume and a target role."""
 
-    def __init__(self, use_embedding: bool = True):
+    def __init__(self, use_embedding: bool = True, use_neural: bool = False,
+                 checkpoint_path: str | Path | None = None, device: str = "auto"):
+        self.use_neural = use_neural
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else DEFAULT_NEURAL_CHECKPOINT
+        if not self.checkpoint_path.is_absolute():
+            self.checkpoint_path = project_root / self.checkpoint_path
+        self.neural_device = device
+        self._neural_model = None
+        self._neural_error = None
+        self._neural_cache = None
         self.canonical = build_canonical_skills()
         self.matcher = SkillMatcher(self.canonical, use_embedding=use_embedding)
         self._skill_aliases_by_id = {}
+        self._kubernetes_name = None
         for record in self.canonical.itertuples(index=False):
             aliases = self._alias_values(getattr(record, "aliases", None))
             aliases.insert(0, str(record.canonical_name))
+            if self._normalize_skill_name(str(record.canonical_name)) == ABBREVIATIONS.get("k8s"):
+                self._kubernetes_name = str(record.canonical_name)
+                aliases.append("k8s")
             unique_aliases = {}
             for alias in aliases:
                 normalized = self._normalize_skill_name(alias)
                 if normalized:
                     unique_aliases.setdefault(normalized, alias.strip())
             self._skill_aliases_by_id[str(record.skill_id)] = list(unique_aliases.values())
+
+    def _expand_supported_aliases(self, text):
+        """Apply the existing K8s equivalence only when Kubernetes is in the ontology.
+
+        Keep this deliberately narrow: other abbreviations and punctuation are
+        unchanged, preserving the trained model's input contract outside this fix.
+        """
+        if self._kubernetes_name is None:
+            return text
+        return re.sub(r"(?<![\w+#.])k8s(?![\w+#]|\.\w)", self._kubernetes_name,
+                      text, flags=re.IGNORECASE)
+
+    def _disable_neural(self, error):
+        self._neural_error = f"{type(error).__name__}: {error}"
+        self._neural_model = None
+        self._neural_cache = None
+        logger.warning("Experimental neural matching unavailable; using rule-based matching: %s",
+                       self._neural_error)
+
+    def _load_neural_model(self):
+        """Lazy load once per analyzer; a failed load is not retried per skill."""
+        if not self.use_neural or self._neural_error is not None:
+            return None
+        if self._neural_model is None:
+            try:
+                import torch
+                from acadlink_skill_gap.src.matching.model import HybridSkillMatcher
+                if self.neural_device not in {"auto", "cpu", "cuda"}:
+                    raise ValueError("device must be auto, cpu or cuda")
+                device = ("cuda" if torch.cuda.is_available() else "cpu") if self.neural_device == "auto" else self.neural_device
+                if device == "cuda" and not torch.cuda.is_available():
+                    raise RuntimeError("CUDA requested but unavailable")
+                self._neural_model = HybridSkillMatcher.load(self.checkpoint_path, device=device)
+            except Exception as error:
+                self._disable_neural(error)
+        return self._neural_model
+
+    def _neural_predictions(self, resume_text, skills, importances):
+        if not self.use_neural or not skills:
+            return {}
+        model = self._load_neural_model()
+        if model is None:
+            return {}
+        key = (resume_text, tuple(skills), tuple(importances))
+        if self._neural_cache is not None and self._neural_cache[0] == key:
+            return self._neural_cache[1]
+        try:
+            import torch
+            from acadlink_skill_gap.src.matching.model import CLASS_NAMES, lexical_features
+            model_resume = self._expand_supported_aliases(resume_text)
+            model_skills = [self._expand_supported_aliases(skill) for skill in skills]
+            # Encode the resume ONCE, batch all skill inputs, reuse the loaded model.
+            with torch.inference_mode():
+                resume_embedding = model.encode_texts([model_resume], "resume")
+                skill_embeddings = model.encode_texts(model_skills, "skill")
+                features = torch.tensor([lexical_features(model_resume, skill, importance)
+                                         for skill, importance in zip(model_skills, importances)],
+                                        dtype=torch.float32)
+                output = model(resume_embeddings=resume_embedding.expand(len(skills), -1),
+                               skill_embeddings=skill_embeddings, features=features)
+                probabilities = output["probabilities"].detach().cpu()
+            if (probabilities.shape != (len(skills), 3) or not torch.isfinite(probabilities).all()
+                    or not ((probabilities >= 0) & (probabilities <= 1)).all()
+                    or not torch.allclose(probabilities.sum(-1), torch.ones(len(skills)), atol=1e-5)):
+                raise ValueError("Invalid neural class probabilities")
+            results = {}
+            for skill, probs in zip(skills, probabilities):
+                status = CLASS_NAMES[int(probs.argmax())]
+                results[self._normalize_skill_name(skill)] = {
+                    "status": status, "confidence": float(probs.max()),
+                    "probabilities": {name: float(probs[i]) for i, name in enumerate(CLASS_NAMES)},
+                    "explanation": f"{status.title()} (experimental neural prediction; weak-label baseline)",
+                }
+            self._neural_cache = key, results
+            return results
+        except Exception as error:
+            # Discard the entire neural batch on failure; never mix a partial batch
+            # of neural statuses with fallback summaries.
+            self._disable_neural(error)
+            return {}
+
+    def _matching_metadata(self, classifications):
+        disagreements = [{"skill": c["skill"], "rule_status": c["rule_status"],
+                          "neural_status": c["status"]}
+                         for c in classifications.values()
+                         if "probabilities" in c and c["rule_status"] != c["status"]]
+        used = any("probabilities" in c for c in classifications.values())
+        return {"requested": "neural", "active": "neural" if used else "rule",
+                "fallback": self._neural_error is not None, "error": self._neural_error,
+                "checkpoint": str(self.checkpoint_path),
+                "device": str(next(self._neural_model.parameters()).device) if self._neural_model is not None else None,
+                "experimental": True,
+                "limitation": "Weak-label baseline; tiny Partial support; probabilities are uncalibrated, not validated real-world accuracy.",
+                "disagreements": disagreements}
+
+    def get_required_skills_from_job_description(self, description, role, company=""):
+        """Keep explicit skill lists; otherwise require complete ontology phrases.
+
+        Do not expand an isolated JD token into a longer fuzzy ontology label.
+        Unknown names in an explicit list remain usable neural/rule targets.
+        """
+        details = []
+        explicit = re.search(r"\b(?:required\s+|preferred\s+|technical\s+)?skills\s*:\s*([^\n]+)",
+                             description, flags=re.I)
+        if explicit:
+            for skill in re.split(r"[,;]", explicit.group(1)):
+                skill = skill.strip().rstrip(".").strip()
+                if not skill:
+                    continue
+                match = self.matcher.match(self._expand_supported_aliases(skill), required=False, deep=False)
+                details.append({"skill": skill,
+                    "skill_id": match["skill_id"] if match and match["method"] == "alias_exact" else "",
+                    "importance": 0.8, "requirement_type": "required",
+                    "source": "job_description_explicit_list"})
+        else:
+            tokens = set(re.findall(r"\w+|[+#]", description.casefold()))
+            hits = []
+            for record in self.canonical.itertuples(index=False):
+                phrases = [str(record.canonical_name)] + self._alias_values(getattr(record, "aliases", None))
+                if self._normalize_skill_name(str(record.canonical_name)) == ABBREVIATIONS.get("k8s"):
+                    phrases.append("k8s")
+                for phrase in phrases:
+                    if not set(re.findall(r"\w+|[+#]", phrase.casefold())).issubset(tokens):
+                        continue
+                    pattern = (r"(?<![\w+#.])" + r"\s+".join(re.escape(word) for word in phrase.split())
+                               + r"(?![\w+#]|\.\w)")
+                    for hit in re.finditer(pattern, description, flags=re.I):
+                        hits.append((hit.start(), hit.end(), phrase.strip(), str(record.skill_id)))
+            # Keep the most specific complete phrase at each position; e.g. SQL
+            # is not separately inferred from a longer explicit SQL skill name.
+            occupied = []
+            for start, end, phrase, sid in sorted(hits, key=lambda h: (-(h[1] - h[0]), h[0], h[2])):
+                if any(start < right and end > left for left, right in occupied):
+                    continue
+                occupied.append((start, end))
+                details.append({"skill": phrase, "skill_id": sid, "importance": 0.8,
+                                "requirement_type": "required", "source": "job_description_exact_phrase"})
+        unique = {}
+        for detail in details:
+            unique.setdefault(self._normalize_skill_name(detail["skill"]), detail)
+        details = list(unique.values())
+        return {"required_skills": [item["skill"] for item in details],
+                "skill_details": details, "role": role, "company": company}
 
     @staticmethod
     def _normalize_skill_name(skill: str) -> str:
@@ -111,7 +272,8 @@ class SkillGapAnalyzer:
         if not isinstance(text, str) or not isinstance(phrase, str) or not phrase.strip():
             return False
         words = phrase.strip().split()
-        pattern = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
+        pattern = (r"(?<![\w+#.])" + r"\s+".join(re.escape(word) for word in words)
+                   + r"(?![\w+#]|\.\w)")
         return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
     def extract_skills_from_resume(self, resume_text: str) -> dict:
@@ -124,7 +286,7 @@ class SkillGapAnalyzer:
         if not resume_text or len(resume_text.strip()) < 10:
             return {"extracted_skills": [], "all_canonical_skills": set()}
 
-        normalized = normalize_text(resume_text, expand_abbrev=False)
+        normalized = normalize_text(self._expand_supported_aliases(resume_text), expand_abbrev=False)
         extracted = {}
 
         # Deduplicate repeated sliding token windows before calling the matcher
@@ -419,16 +581,16 @@ class SkillGapAnalyzer:
 
         return result
     def analyze_gap(self, resume_text: str, target_role: str,
-                    company: str = "") -> dict:
+                    company: str = "", job_description: str = "") -> dict:
         """Analyze resume skills against the requirements for a target role."""
         gap_analysis, _ = self._build_gap_analysis(
-            resume_text, target_role, company
+            resume_text, target_role, company, job_description
         )
         return gap_analysis
     
     
     def _build_gap_analysis(self, resume_text: str, target_role: str,
-                            company: str = "") -> tuple[dict, dict]:
+                            company: str = "", job_description: str = "") -> tuple[dict, dict]:
         # 1. Extract skills from resume
         resume_analysis = self.extract_skills_from_resume(resume_text)
         extracted_by_key = {}
@@ -439,7 +601,8 @@ class SkillGapAnalyzer:
                 extracted_by_key.setdefault(normalized, skill_name)
 
         # 2. Get required skills for target role
-        role_analysis = self.get_required_skills_for_role(target_role, company)
+        role_analysis = (self.get_required_skills_from_job_description(job_description, target_role, company)
+                         if job_description else self.get_required_skills_for_role(target_role, company))
         required_by_key = {}
         for skill_name in role_analysis["required_skills"]:
             normalized = self._normalize_skill_name(skill_name)
@@ -454,21 +617,28 @@ class SkillGapAnalyzer:
 
         # One classification pass is shared by analyze_gap() and predict().
         classifications = {}
+        all_by_key = dict(required_by_key)
+        # Include extracted-only skills so predict() uses one neural batch and a
+        # single consistent status source for both required and extracted skills.
+        if self.use_neural:
+            for key, name in extracted_by_key.items():
+                all_by_key.setdefault(key, name)
+        for normalized, display_name in all_by_key.items():
+            status, confidence, explanation = self._classify_skill_two_step(
+                display_name, resume_text, display_name, self.matcher,
+                resume_skills=resume_analysis["extracted_skills"] if normalized in required_by_key else None)
+            classifications[normalized] = {"skill": display_name, "status": status,
+                "confidence": confidence, "explanation": explanation, "rule_status": status,
+                "rule_confidence": confidence, "rule_explanation": explanation,
+                "importance": detail_by_key.get(normalized, {}).get("importance", 0.5)}
+        neural = self._neural_predictions(resume_text, list(all_by_key.values()),
+                                         [c["importance"] for c in classifications.values()])
+        for key, result in neural.items():
+            classifications[key].update(result)
         present_skills = []
         missing_with_detail = []
         for normalized, display_name in required_by_key.items():
-            status, confidence, explanation = self._classify_skill_two_step(
-                display_name,
-                resume_text,
-                display_name,
-                self.matcher,
-                resume_skills=resume_analysis["extracted_skills"],
-            )
-            classifications[normalized] = {
-                "status": status,
-                "confidence": confidence,
-                "explanation": explanation,
-            }
+            status = classifications[normalized]["status"]
             if status == "present":
                 present_skills.append(display_name)
                 continue
@@ -510,6 +680,10 @@ class SkillGapAnalyzer:
             "company": role_analysis["company"],
             "analysis_timestamp": pd.Timestamp.now().isoformat(),
         }
+        if self.use_neural:
+            gap_analysis["matching"] = self._matching_metadata(classifications)
+            gap_analysis["partial_skills"] = [display for key, display in required_by_key.items()
+                                               if classifications[key]["status"] == "partial"]
         return gap_analysis, classifications
 
     def _classify_skill_two_step(self, skill: str, resume_text: str,
@@ -519,7 +693,26 @@ class SkillGapAnalyzer:
                                   resume_skills: list[dict] | None = None) -> tuple[str, float, str]:
         """Classify only from resume evidence; ontology membership is not evidence."""
         target_name = required_skill.strip() or skill.strip()
-        match = matcher.match(target_name, required=False)
+        if (self._kubernetes_name is not None and
+                self._normalize_skill_name(self._expand_supported_aliases(target_name)) ==
+                self._normalize_skill_name(self._kubernetes_name)):
+            # The full ontology may map this name fuzzily to a broader software
+            # category. A registered, explicit alias must take precedence.
+            if any(self._text_contains_phrase(resume_text, alias)
+                   for alias in (self._kubernetes_name, "k8s")):
+                return "present", 1.0, "Present (explicit Kubernetes/K8s alias evidence)"
+        # The shared matcher intentionally strips punctuation for broad lookup,
+        # which merges C, C++ and C#. For these languages require their distinct
+        # literal spelling (or an explicit ontology alias) in the source resume.
+        if self._normalize_skill_name(target_name) in {"c", "c++", "c#"}:
+            language_aliases = [target_name]
+            for record in self.canonical.itertuples(index=False):
+                if self._normalize_skill_name(str(record.canonical_name)) == self._normalize_skill_name(target_name):
+                    language_aliases.extend(self._alias_values(getattr(record, "aliases", None)))
+            if any(self._text_contains_phrase(resume_text, alias) for alias in language_aliases):
+                return "present", 1.0, "Present (exact language evidence)"
+            return "missing", 0.0, "Missing (no evidence for this distinct programming language)"
+        match = matcher.match(self._expand_supported_aliases(target_name), required=False)
         method = match.get("method", "") if match else ""
         confidence = float(match.get("confidence", 0.0)) if match else 0.0
         skill_id = str(match.get("skill_id", "")) if match else ""
@@ -587,7 +780,8 @@ class SkillGapAnalyzer:
             return "partial", confidence, "Partial (related ontology match)"
         return "missing", 0.0, "Missing (no meaningful resume evidence)"
 
-    def predict(self, resume_text: str, target_role: str, company: str = "") -> dict:
+    def predict(self, resume_text: str, target_role: str, company: str = "",
+                job_description: str = "") -> dict:
         """Run skill gap analysis and return structured JSON output.
 
         Returns dict with keys:
@@ -597,7 +791,7 @@ class SkillGapAnalyzer:
         - priority_gaps: list of skill names (missing, ranked by importance)
         """
         gap_analysis, classifications = self._build_gap_analysis(
-            resume_text, target_role, company
+            resume_text, target_role, company, job_description
         )
 
         all_skills = {}
@@ -636,6 +830,12 @@ class SkillGapAnalyzer:
                 "importance": round(imp, 2),
                 "explanation": explanation,
             })
+            if self.use_neural and classification is not None:
+                skills[-1]["rule_status"] = classification["rule_status"]
+                skills[-1]["rule_confidence"] = classification["rule_confidence"]
+                if "probabilities" in classification:
+                    skills[-1]["probabilities"] = classification["probabilities"]
+                    skills[-1]["importance"] = round(classification["importance"], 2)
 
         # Priority gaps - missing skills sorted by importance
         priority_gaps = [
@@ -645,12 +845,15 @@ class SkillGapAnalyzer:
         present_in_resume = gap_analysis["gap_summary"]["present_in_resume"]
         match_score = round(present_in_resume / total_required, 3) if total_required else 0.0
 
-        return {
+        result = {
             "target_role": target_role,
             "overall_match_score": match_score,
             "skills": skills,
             "priority_gaps": priority_gaps,
         }
+        if self.use_neural:
+            result["matching"] = gap_analysis["matching"]
+        return result
 
     def format_report(self, gap_analysis: dict) -> str:
         """Format the gap analysis as a human-readable report."""
@@ -660,6 +863,12 @@ class SkillGapAnalyzer:
         lines.append("=" * 70)
         lines.append(f"Target Role: {gap_analysis['role']}")
         lines.append(f"Company: {gap_analysis['company']}")
+        if "matching" in gap_analysis:
+            matching = gap_analysis["matching"]
+            lines.append(f"Matching: {matching['active']} (experimental neural requested)")
+            lines.append(matching["limitation"])
+            if matching["fallback"]:
+                lines.append(f"Rule-based fallback: {matching['error']}")
         lines.append("-" * 70)
 
         # Summary
@@ -671,6 +880,11 @@ class SkillGapAnalyzer:
         lines.append(f"  Coverage:           {summary['coverage_percentage']}%")
         lines.append(f"  Gap Ratio:          1:{round(1/summary['gap_ratio'], 2) if summary['gap_ratio'] > 0 else 'N/A'}")
         lines.append("")
+
+        if gap_analysis.get("partial_skills"):
+            lines.append("- PARTIAL SKILLS (Included in Gaps Below)")
+            lines.extend(f"  - {skill}" for skill in gap_analysis["partial_skills"])
+            lines.append("")
 
         # Present skills (good news)
         lines.append("- PRESENT SKILLS (Found in Your Resume)")
@@ -727,6 +941,13 @@ def main():
     parser.add_argument("--resume-file", required=False, default="", help="Path to resume PDF or DOCX file")
     parser.add_argument("--role", required=True, help="Target job role (e.g., Software Engineer)")
     parser.add_argument("--company", default="", help="Target company (optional)")
+    parser.add_argument("--neural", action="store_true", help="Use the experimental neural checkpoint; fall back to rules on failure")
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_NEURAL_CHECKPOINT)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    jd_group = parser.add_mutually_exclusive_group()
+    jd_group.add_argument("--job-description", default="", help="Match supplied JD text instead of role requirements")
+    jd_group.add_argument("--job-description-file", type=Path, help="UTF-8 job description text file")
+    parser.add_argument("--output", type=Path, default=Path("skill_gap_result.json"), help="Structured JSON output path")
     args = parser.parse_args()
 
     # Make --resume and --resume-file mutually exclusive
@@ -763,19 +984,28 @@ def main():
         return
 
     # Initialize analyzer
+    job_description = args.job_description
+    if args.job_description_file:
+        try:
+            job_description = args.job_description_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            parser.error(f"Could not read job description: {error}")
+        if not job_description.strip():
+            parser.error("Job description file is empty")
     print("Initializing Skill Gap Analyzer...")
-    analyzer = SkillGapAnalyzer(use_embedding=False)
+    analyzer = SkillGapAnalyzer(use_embedding=False, use_neural=args.neural,
+                               checkpoint_path=args.checkpoint, device=args.device)
 
     # Run analysis
     print(f"Analyzing resume against target role: {args.role}")
-    gap_analysis = analyzer.analyze_gap(args.resume, args.role, args.company)
+    gap_analysis = analyzer.analyze_gap(resume_text, args.role, args.company, job_description)
 
     # Display report
     print("\n" + analyzer.format_report(gap_analysis))
 
     # Also save detailed results as structured JSON
-    result = analyzer.predict(args.resume, args.role, args.company)
-    output_path = Path("skill_gap_result.json")
+    result = analyzer.predict(resume_text, args.role, args.company, job_description)
+    output_path = args.output
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 

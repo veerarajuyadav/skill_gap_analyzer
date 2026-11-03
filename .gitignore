@@ -41,8 +41,9 @@ models/
 # Generated results
 skill_gap_result.json
 *.log
-# All datasets and generated data
-acadlink_skill_gap/data/
+# Generated data remains local; retain only the reviewed builder source.
+acadlink_skill_gap/data/*
+!acadlink_skill_gap/data/build_dataset_c_improved.py
 acadlink_skill_gap_broken/
 
 # Model artifacts

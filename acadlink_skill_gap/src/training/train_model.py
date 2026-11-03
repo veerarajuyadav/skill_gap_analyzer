@@ -1,326 +1,53 @@
-"""
-Training script for the AcadLink Hybrid Skill Matching Model.
+"""Train an experimental three-class baseline on the preserved improved splits.
 
-Trains the model on Dataset C (skill gap matching) with:
-- Multi-task learning: skill status classification + gap severity prediction
-- Hard negative mining
-- Ontology-enhanced features
-"""
+Examples (from repository root):
+ python -B -m acadlink_skill_gap.src.training.train_model --smoke-test --run-name smoke
+ python -B -m acadlink_skill_gap.src.training.train_model --epochs 2 --skip-test --run-name short
+ python -B -m acadlink_skill_gap.src.training.train_model --epochs 20 --run-name full
 
+All rows are retained; no resplitting, label fabrication, evidence-derived inputs,
+or oversampling. Checkpoint selection uses validation only. Partial has only
+28 training/6 validation/7 test rows: metrics do not establish reliable three-class
+performance. Class weighting cannot replace class diversity.
+"""
 from __future__ import annotations
 
-import sys
-sys.path.insert(0, 'D:/skillgap_analyser/acadlink_skill_gap')
-
+import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
 import json
-import math
-import os
-import random
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+import random
+import sys
+import time
+
+# Support both direct script execution and python -m without hard-coded drives.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics import classification_report, f1_score, precision_recall_fscore_support
-from sklearn.model_selection import train_test_split
-from src.paths import PROCESSED_DIR, MODEL_CACHE_DIR, REPORTS_DIR
-from src.matching.model import ModelConfig, HybridSkillMatcher, FeatureFusion
-from src.ontology.skills import build_canonical_skills, SkillMatcher as OntologyMatcher
-from src.preprocessing.text_norm import normalize_text
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
+from acadlink_skill_gap.src.matching.model import (
+    CLASS_NAMES, SEVERITY_NAMES, HybridSkillMatcher, ModelConfig, lexical_features)
+from acadlink_skill_gap.src.paths import PROCESSED_DIR, MODELS_DIR
 
 
-class SkillGapDataset(Dataset):
-    """PyTorch Dataset for skill gap matching examples."""
-
-    def __init__(self, records: pd.DataFrame, matcher: HybridSkillMatcher,
-                 max_text_len: int = 512):
-        self.records = records.reset_index(drop=True)
-        self.matcher = matcher
-        self.max_text_len = max_text_len
-
-        # Pre-compute features
-        self._precompute_features()
-
-    def _precompute_features(self):
-        """Pre-compute handcrafted features for all records."""
-        self.resume_texts = []
-        self.skill_names = []
-        self.skill_importances = []
-        self.occupation_relevances = []
-        self.status_labels = []
-        self.resume_embeddings = []
-        self.skill_embeddings = []
-
-        for _, row in self.records.iterrows():
-            resume_text = str(row.get('resume_text', ''))
-            required_skill = str(row.get('required_skills_raw', ''))
-            importance = float(row.get('skill_importance', 0.5))
-
-            self.resume_texts.append(resume_text)
-            self.skill_names.append(required_skill)
-            self.skill_importances.append(importance)
-
-            # Occupation relevance from job_title
-            job_title = str(row.get('job_title', ''))
-            # Simple mapping: tech roles have higher relevance
-            tech_keywords = ['engineer', 'developer', 'software', 'analyst', 'architect']
-            occ_rel = 0.7 if any(k in job_title.lower() for k in tech_keywords) else 0.3
-            self.occupation_relevances.append(occ_rel)
-
-            # Status label
-            status = int(row.get('skill_status', 0))
-            self.status_labels.append(status)
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        resume_text = self.resume_texts[idx]
-        skill_name = self.skill_names[idx]
-        importance = self.skill_importances[idx]
-        occ_rel = self.occupation_relevances[idx]
-        status = self.status_labels[idx]
-
-        # Tokenize and create embeddings using the sentence encoder
-        # We'll use mean pooling over the encoded tokens
-        resume_encoding = self.matcher.sentence_encoder.encode(
-            resume_text, convert_to_tensor=True, normalize_embeddings=True
-        )
-        skill_encoding = self.matcher.sentence_encoder.encode(
-            skill_name, convert_to_tensor=True, normalize_embeddings=True
-        )
-
-        # Cosine similarity
-        cosine_sim = float(
-            torch.sum(resume_encoding * skill_encoding).item()
-        )
-
-        # Handcrafted features
-        norm_resume = normalize_text(resume_text, expand_abbrev=False)
-        norm_skill = normalize_text(skill_name, expand_abbrev=False)
-
-        resume_tokens = set(norm_resume.split())
-        skill_tokens = set(norm_skill.split())
-        inter = resume_tokens & skill_tokens
-        keyword_feat = len(inter) / max(len(skill_tokens), 1)
-
-        features = {
-            "similarity": torch.tensor(cosine_sim, dtype=torch.float32),
-            "keyword": torch.tensor(keyword_feat, dtype=torch.float32),
-            "ontology": torch.tensor(0.0, dtype=torch.float32),  # placeholder
-            "importance": torch.tensor(importance, dtype=torch.float32),
-            "occupation": torch.tensor(occ_rel, dtype=torch.float32),
-        }
-
-        # Status label
-        label = torch.tensor(status, dtype=torch.long)
-
-        return {
-            "resume_embedding": resume_encoding,
-            "skill_embedding": skill_encoding,
-            "features": features,
-            "label": label,
-            "resume_text": resume_text,
-            "skill_name": skill_name,
-        }
+def file_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Collate function for DataLoader."""
-    # Stack embeddings
-    resume_embeddings = torch.stack([item["resume_embedding"] for item in batch])
-    skill_embeddings = torch.stack([item["skill_embedding"] for item in batch])
-    features_list = [item["features"] for item in batch]
-    labels = torch.stack([item["label"] for item in batch])
-
-    # Combine features per batch item
-    combined_features = []
-    for f in features_list:
-        # Concatenate all feature vectors
-        vec = torch.cat([v.unsqueeze(0) for v in f.values()], dim=0)
-        combined_features.append(vec)
-
-    return {
-        "resume_embeddings": resume_embeddings,
-        "skill_embeddings": skill_embeddings,
-        "features": combined_features,
-        "labels": labels,
-        "resume_texts": [item["resume_text"] for item in batch],
-        "skill_names": [item["skill_name"] for item in batch],
-    }
-
-
-def evaluate_model(model: HybridSkillMatcher, dataloader: DataLoader,
-                   device: torch.device) -> Dict[str, float]:
-    """Evaluate model performance on a dataset.
-
-    Returns dict with metrics: accuracy, macro_f1, weighted_f1, per_class_f1
-    """
-    model.eval()
-    all_predictions = []
-    all_labels = []
-    all_probabilities = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
-
-            # Forward pass through classifier
-            # The model's classifier expects fused features
-            fused_outputs = []
-            for features in batch["features"]:
-                # features is a tensor of shape [5] = [similarity, keyword, ontology, importance, occupation]
-                sim = features[0].item()
-                kw = features[1].item()
-                ont = features[2].item()
-                imp = features[3].item()
-                occ = features[4].item()
-                
-                fused = model.feature_fusion({"similarity": torch.tensor(sim, device=device, dtype=torch.float32),
-                                             "keyword": torch.tensor(kw, device=device, dtype=torch.float32),
-                                             "ontology": torch.tensor(ont, device=device, dtype=torch.float32),
-                                             "importance": torch.tensor(imp, device=device, dtype=torch.float32),
-                                             "occupation": torch.tensor(occ, device=device, dtype=torch.float32)})
-                logit = model.classifier(fused)
-                fused_outputs.append(logit)
-
-            fused_logits = torch.stack(fused_outputs)
-            probabilities = torch.softmax(fused_logits, dim=-1)
-            predictions = torch.argmax(probabilities, dim=-1).cpu().numpy()
-
-            all_predictions.extend(predictions.tolist())
-            all_labels.extend(batch["labels"].cpu().numpy().tolist())
-            all_probabilities.extend(probabilities.cpu().numpy().tolist())
-
-    # Compute metrics
-    accuracy = float(np.mean(np.array(all_predictions) == np.array(all_labels)))
-
-    # Per-class metrics
-    precision, recall, f1, support = precision_recall_fscore_support(
-        all_labels, all_predictions, average=None, labels=[0, 1, 2]
-    )
-
-    macro_f1 = float(f1_score(all_labels, all_predictions, average='macro'))
-    weighted_f1 = float(f1_score(all_labels, all_predictions, average='weighted'))
-
-    per_class = {
-        "class_0_missing": {"precision": float(precision[0]), "recall": float(recall[0]),
-                            "f1": float(f1[0]), "support": int(support[0])},
-        "class_1_partial": {"precision": float(precision[1]), "recall": float(recall[1]),
-                           "f1": float(f1[1]), "support": int(support[1])},
-        "class_2_present": {"precision": float(precision[2]), "recall": float(recall[2]),
-                            "f1": float(f1[2]), "support": int(support[2])},
-    }
-
-    # Compute optimal thresholds from validation probability distributions
-    if 'val_probabilities' in locals() and 'val_labels' in locals():
-        val_probs_arr = np.array(val_probabilities)
-        val_labels_arr = np.array(val_labels)
-        optimal_thresholds = compute_optimal_thresholds(val_probs_arr, val_labels_arr)
-    else:
-        optimal_thresholds = {"missing": 0.35, "partial": 0.40, "present": 0.65}
-
-    return {
-        "accuracy": accuracy,
-        "macro_f1": macro_f1,
-        "weighted_f1": weighted_f1,
-        "per_class": per_class,
-        "predictions": all_predictions,
-        "labels": all_labels,
-        "optimal_thresholds": optimal_thresholds,
-    }
-
-
-def train_epoch(model: HybridSkillMatcher, dataloader: DataLoader,
-                optimizer: torch.optim.Optimizer, device: torch.device,
-                epoch_idx: int, class_weights_tensor: torch.Tensor = None,
-                config: ModelConfig = None) -> Dict[str, float]:
-    """Train for one epoch.
-
-    Returns dict with training loss and metrics.
-    """
-    model.train()
-    total_loss = 0.0
-    all_predictions = []
-    all_labels = []
-
-    # Loss functions
-    if class_weights_tensor is not None:
-        classification_criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
-    elif config is not None and config.get('use_focal_loss', False):
-        from src.training.focal_loss import FocalLoss
-        focal_gamma = config.get('focal_gamma', 2.0)
-        classification_criterion = FocalLoss(gamma=focal_gamma, reduction='mean')
-    else:
-        classification_criterion = nn.CrossEntropyLoss()
-    # Feature fusion is trained via the classifier head
-
-    for step, batch in enumerate(dataloader):
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
-
-# Forward pass
-        # batch["features"] is a list of tensors, each of shape [5] = [similarity, keyword, ontology, importance, occupation]
-        for features in batch["features"]:
-            # features is a tensor of shape [5], extract individual values using .item()
-            sim = features[0].item()
-            kw = features[1].item()
-            ont = features[2].item()
-            imp = features[3].item()
-            occ = features[4].item()
-            
-            # Use Python floats directly for feature fusion
-            fused = model.feature_fusion({"similarity": 0.4 * sim + 0.2 * kw + 0.2 * ont + 0.1 * imp + 0.1 * occ})
-            # Actually, let's pass them as the model expects - as a dict of tensors
-            # But ensure they're proper 1-element tensors, not 0-dim
-            sim_t = torch.tensor([sim], device=device, dtype=torch.float32)
-            kw_t = torch.tensor([kw], device=device, dtype=torch.float32)
-            ont_t = torch.tensor([ont], device=device, dtype=torch.float32)
-            imp_t = torch.tensor([imp], device=device, dtype=torch.float32)
-            occ_t = torch.tensor([occ], device=device, dtype=torch.float32)
-            fused = model.feature_fusion({"similarity": sim_t, "keyword": kw_t, "ontology": ont_t, "importance": imp_t, "occupation": occ_t})
-            fused_outputs.append(logit)
-
-        fused_logits = torch.stack(fused_outputs)
-        loss = classification_criterion(fused_logits, batch["labels"])
-
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-        # Collect predictions
-        probs = torch.softmax(fused_logits, dim=-1)
-        preds = torch.argmax(probs, dim=-1).cpu().numpy()
-        all_predictions.extend(preds.tolist())
-        all_labels.extend(batch["labels"].cpu().numpy().tolist())
-
-        if step % 50 == 0:
-            print(f'  Epoch {epoch_idx}, Step {step}, Loss: {loss.item():.4f}')
-
-    # Compute epoch metrics
-    accuracy = float(np.mean(np.array(all_predictions) == np.array(all_labels)))
-    macro_f1 = float(f1_score(all_labels, all_predictions, average='macro'))
-    weighted_f1 = float(f1_score(all_labels, all_predictions, average='weighted'))
-
-    return {
-        "loss": total_loss / max(1, len(dataloader)),
-        "accuracy": accuracy,
-        "macro_f1": macro_f1,
-        "weighted_f1": weighted_f1,
-    }
-
-
-def set_seed(seed: int = 42):
-    """Set random seeds for reproducibility."""
+def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -328,286 +55,356 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-def compute_optimal_thresholds(val_probs: np.ndarray, val_labels: np.ndarray) -> Dict[str, float]:
-    """Compute optimal decision thresholds per class using validation set.
-    
-    Youden's J statistic (maximize sensitivity + specificity - 1) per class.
-    """
-    from sklearn.metrics import precision_recall_curve
-    
-    optimal = {}
-    n_classes = 3
-    status_labels = ["missing", "partial", "present"]
-    
-    for c in range(n_classes):
-        # Get true binary labels for class c (one-vs-rest)
-        y_true_binary = (val_labels == c).astype(int)
-        y_probs = val_probs[:, c]
-        
-        if y_true_binary.sum() == 0 or (y_true_binary == 0).sum() == 0:
-            # Fallback: use 0.5 if only one class present in val set
-            optimal[status_labels[c]] = 0.5
-            continue
-        
-        # Try threshold values from 0.0 to 1.0 in steps
-        best_j = -1
-        best_thresh = 0.5
-        for thresh in np.arange(0.05, 1.0, 0.01):
-            y_pred_binary = (y_probs >= thresh).astype(int)
-            # Compute precision and recall
-            tp = (y_pred_binary * y_true_binary).sum()
-            fp = (y_pred_binary * (1 - y_true_binary)).sum()
-            fn = ((1 - y_pred_binary) * y_true_binary).sum()
-            
-            precision_val = tp / max(tp + fp, 1)
-            recall_val = tp / max(tp + fn, 1)
-            
-            # Youden's J = sensitivity + specificity - 1
-            # approximated by recall + precision - 1 for balanced optimization
-            j = recall_val + precision_val - 1
-            if j > best_j:
-                best_j = j
-                best_thresh = thresh
-        
-        optimal[status_labels[c]] = float(best_thresh)
-    
-    return optimal
+def load_splits(processed):
+    """Read only model inputs, IDs and targets. Never read label-derived evidence."""
+    frames, hashes = {}, {}
+    columns = ["record_id", "resume_id", "resume_text", "required_skills_raw",
+               "skill_importance", "skill_status"]
+    for name in ("train", "val", "test"):
+        path = processed / f"dataset_C_split_{name}_improved.parquet"
+        available = pq.read_schema(path).names
+        optional = ["gap_severity"] if "gap_severity" in available else []
+        frame = pd.read_parquet(path, columns=columns + optional)
+        if frame.empty or frame[columns].isna().any().any():
+            raise ValueError(f"{name}: empty or missing required inputs/labels; no rows dropped")
+        if frame.record_id.duplicated().any() or not frame.skill_status.isin([0, 1, 2]).all():
+            raise ValueError(f"{name}: duplicate IDs or invalid labels")
+        for c in ["resume_text", "required_skills_raw"]:
+            if not frame[c].map(lambda x: isinstance(x, str) and bool(x.strip())).all():
+                raise ValueError(f"{name}: blank/non-text {c}; refusing to discard examples")
+        if not frame.skill_importance.between(0, 1).all():
+            raise ValueError(f"{name}: importance outside [0, 1]")
+        frames[name] = frame.reset_index(drop=True)
+        hashes[str(path)] = file_hash(path)
+    for left, right in [("train", "val"), ("train", "test"), ("val", "test")]:
+        if set(frames[left].resume_id) & set(frames[right].resume_id):
+            raise ValueError(f"Resume ID overlap between {left}/{right}")
+        if set(frames[left].record_id) & set(frames[right].record_id):
+            raise ValueError(f"Record ID overlap between {left}/{right}")
+    print("Rows and class support:", {s: {"rows": len(d),
+          "classes": np.bincount(d.skill_status.astype(int), minlength=3).tolist()}
+          for s, d in frames.items()}, flush=True)
+    return frames, hashes
+
+
+def cached_embeddings(model, texts, kind, cache_dir, encoder_fingerprint, batch_size):
+    """Cache only unique input text embeddings; no targets or fitted statistics."""
+    texts = sorted(set(texts))
+    text_hashes = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in texts]
+    key = hashlib.sha256(json.dumps([encoder_fingerprint, kind, text_hashes]).encode()).hexdigest()
+    path = cache_dir / f"{kind}_{key}.pt"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        embeddings = data["embeddings"]
+        if data["text_hashes"] != text_hashes or data["fingerprint"] != encoder_fingerprint:
+            raise ValueError(f"Embedding cache metadata mismatch: {path}")
+        print(f"Loaded {kind} embedding cache: {len(texts)} unique texts", flush=True)
+    else:
+        print(f"Encoding {len(texts)} unique {kind} texts with frozen MiniLM", flush=True)
+        parts = []
+        for start in range(0, len(texts), 25 if kind == "resume" else 100):
+            count = 25 if kind == "resume" else 100
+            parts.append(model.encode_texts(texts[start:start + count], kind, batch_size))
+            print(f"  encoded {min(start + count, len(texts))}/{len(texts)} {kind} texts", flush=True)
+        embeddings = torch.cat(parts).float().cpu()
+        temporary = path.with_suffix(".tmp")
+        torch.save({"embeddings": embeddings, "text_hashes": text_hashes,
+                    "fingerprint": encoder_fingerprint}, temporary)
+        temporary.replace(path)
+    if embeddings.shape != (len(texts), model.embedding_dim) or not torch.isfinite(embeddings).all():
+        raise ValueError("Invalid embedding cache tensor")
+    return embeddings, {text: i for i, text in enumerate(texts)}, str(path)
+
+
+class SkillGapDataset(Dataset):
+    """CPU tensor/index dataset. No encoder, file I/O, or GPU work in __getitem__."""
+
+    def __init__(self, records, resume_table, resume_index, skill_table, skill_index):
+        self.resume_table, self.skill_table = resume_table, skill_table
+        self.resume_ids = torch.tensor([resume_index[t] for t in records.resume_text])
+        self.skill_ids = torch.tensor([skill_index[t] for t in records.required_skills_raw])
+        pairs = zip(records.resume_text, records.required_skills_raw, records.skill_importance)
+        self.features = torch.tensor([lexical_features(r, s, w) for r, s, w in pairs],
+                                     dtype=torch.float32)
+        self.labels = torch.tensor(records.skill_status.astype(int).to_numpy(), dtype=torch.long)
+        self.severity = torch.full((len(records),), -100, dtype=torch.long)
+        if "gap_severity" in records:
+            mapping = {name: i for i, name in enumerate(SEVERITY_NAMES)}
+            mapping.update({"0": 0, "1": 1, "2": 2, "3": 3})
+            self.severity = torch.tensor([mapping.get(str(v).strip().casefold(), -100)
+                                          for v in records.gap_severity], dtype=torch.long)
+            if (self.severity == -100).any():
+                print(f"Severity: {(self.severity == -100).sum().item()} unavailable targets; status rows retained")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return {"resume_embeddings": self.resume_table[self.resume_ids[idx]],
+                "skill_embeddings": self.skill_table[self.skill_ids[idx]],
+                "features": self.features[idx], "labels": self.labels[idx],
+                "severity": self.severity[idx]}
+
+
+def model_inputs(batch, device):
+    return {key: batch[key].to(device) for key in
+            ("resume_embeddings", "skill_embeddings", "features")}
+
+
+def metrics_from_confusion(confusion):
+    cm = confusion.to(torch.float64)
+    support, predicted = cm.sum(1), cm.sum(0)
+    precision = cm.diag() / predicted.clamp_min(1)
+    recall = cm.diag() / support.clamp_min(1)
+    f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-15)
+    total = support.sum().clamp_min(1)
+    return {"accuracy": float(cm.diag().sum() / total),
+            "macro_f1": float(f1.mean()),
+            "weighted_f1": float((f1 * support).sum() / total),
+            "confusion_matrix": confusion.tolist(),
+            "per_class": {name: {"precision": float(precision[i]), "recall": float(recall[i]),
+                                 "f1": float(f1[i]), "support": int(support[i]),
+                                 "predicted": int(predicted[i])}
+                          for i, name in enumerate(CLASS_NAMES)}}
+
+
+def evaluate_model(model, loader, device):
+    model.eval()
+    confusion = torch.zeros(3, 3, dtype=torch.long)
+    severity_correct = severity_total = 0
+    with torch.no_grad():
+        for batch in loader:
+            output = model(**model_inputs(batch, device))
+            pred = output["logits"].argmax(-1).cpu()
+            confusion += torch.bincount(3 * batch["labels"] + pred, minlength=9).reshape(3, 3)
+            if "severity_logits" in output:
+                valid = batch["severity"] >= 0
+                severity_correct += int((output["severity_logits"].argmax(-1).cpu()[valid]
+                                         == batch["severity"][valid]).sum())
+                severity_total += int(valid.sum())
+    result = metrics_from_confusion(confusion)
+    if severity_total:
+        result["severity_accuracy"] = severity_correct / severity_total
+    return result
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    numerator = denominator = 0.
+    for batch in loader:
+        optimizer.zero_grad(set_to_none=True)
+        output = model(**model_inputs(batch, device))
+        labels = batch["labels"].to(device)
+        per_row = nn.functional.cross_entropy(output["logits"], labels,
+                                              weight=criterion.weight, reduction="none")
+        normalizer = criterion.weight[labels].sum()
+        loss = per_row.sum() / normalizer
+        if "severity_logits" in output:
+            target = batch["severity"].to(device)
+            valid = target >= 0
+            if valid.any():
+                loss = loss + model.config.severity_loss_weight * nn.functional.cross_entropy(
+                    output["severity_logits"][valid], target[valid])
+        if not torch.isfinite(loss):
+            raise RuntimeError("Non-finite loss; stopping without dropping any examples")
+        loss.backward()
+        nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.)
+        optimizer.step()
+        numerator += float(per_row.detach().sum())
+        denominator += float(normalizer)
+    return numerator / denominator
+
+
+def smoke_check(model, loader, device, checkpoint_path):
+    """Actual batch update, finite gradients, frozen encoder, save/reload parity."""
+    model.train()
+    batch = next(iter(loader))
+    inputs = model_inputs(batch, device)
+    snapshots = {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=.001)
+    output = model(**inputs)
+    if output["logits"].shape != (len(batch["labels"]), 3):
+        raise AssertionError("Wrong logit shape")
+    loss = nn.functional.cross_entropy(output["logits"], batch["labels"].to(device))
+    if "severity_logits" in output and (batch["severity"] >= 0).any():
+        valid = batch["severity"] >= 0
+        loss = loss + nn.functional.cross_entropy(
+            output["severity_logits"][valid.to(device)], batch["severity"][valid].to(device))
+    loss.backward()
+    gradients = {}
+    for name, module in [("fusion", model.feature_fusion), ("classifier", model.classifier)]:
+        grad = [p.grad for p in module.parameters()]
+        if not all(g is not None and torch.isfinite(g).all() for g in grad):
+            raise AssertionError(f"{name} gradients absent/non-finite")
+        gradients[name] = sum(float(g.abs().sum()) for g in grad)
+        if gradients[name] == 0:
+            raise AssertionError(f"{name} has zero gradients")
+    if any(p.requires_grad or p.grad is not None for p in model.sentence_encoder.parameters()):
+        raise AssertionError("Encoder is not frozen")
+    optimizer.step()
+    if not any(not torch.equal(snapshots[n], p) for n, p in model.named_parameters() if n in snapshots):
+        raise AssertionError("Optimizer did not update weights")
+    model.eval()
+    with torch.no_grad():
+        expected = model(**inputs)["logits"].cpu()
+    model.save(checkpoint_path, {"purpose": "one-batch smoke test"})
+    reloaded = HybridSkillMatcher.load(checkpoint_path, device)
+    with torch.no_grad():
+        actual = reloaded(**inputs)["logits"].cpu()
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    for name, p in model.named_parameters():
+        if name in snapshots:
+            with torch.no_grad():
+                p.copy_(snapshots[name])
+    model.zero_grad(set_to_none=True)
+    result = {"loss": float(loss.detach()), "batch_rows": len(batch["labels"]),
+              "logit_shape": list(actual.shape), "gradient_l1": gradients,
+              "encoder_frozen": True, "weights_updated": True, "reload_parity": True}
+    print("SMOKE PASSED", json.dumps(result), flush=True)
+    return result
 
 
 def main():
-    """Main training function."""
-    set_seed(42)
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--processed-dir", type=Path, default=PROCESSED_DIR)
+    parser.add_argument("--output-dir", type=Path, default=MODELS_DIR / "neural_baseline")
+    parser.add_argument("--run-name", default="baseline_full")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--learning-rate", type=float, default=.001)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--class-weight-power", type=float, default=.5,
+                        help="0.5 = square-root inverse frequency; 1 = balanced inverse frequency")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--encoder-batch-size", type=int, default=32)
+    parser.add_argument("--encoder-path", type=Path)
+    parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--skip-test", action="store_true")
+    args = parser.parse_args()
+    if min(args.epochs, args.patience, args.batch_size, args.threads) < 1:
+        parser.error("Epochs, patience, batch size and threads must be positive")
+    if args.workers < 0 or not 0 < args.class_weight_power <= 1:
+        parser.error("Invalid workers or class weight power")
+    run_dir = args.output_dir / args.run_name
+    if run_dir.exists():
+        raise FileExistsError(f"Run directory already exists; choose a fresh --run-name: {run_dir}")
+    set_seed(args.seed)
+    torch.set_num_threads(args.threads)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Load Dataset C splits
-    processed = Path("D:/skillgap_analyser/acadlink_skill_gap/data/processed")
-
-    print("Loading dataset splits...")
-    train_df = pd.read_parquet(processed / "dataset_C_split_train.parquet")
-    val_df = pd.read_parquet(processed / "dataset_C_split_val.parquet")
-    test_df = pd.read_parquet(processed / "dataset_C_split_test.parquet")
-
-    print(f"Train: {len(train_df)} records")
-    print(f"Validation: {len(val_df)} records")
-    print(f"Test: {len(test_df)} records")
-
-    # Print status distribution
-    for name, df in [("Train", train_df), ("Validation", val_df), ("Test", test_df)]:
-        ss = df['skill_status'].value_counts().to_dict()
-        print(f"{name}: Present={ss.get(2,0)}, Partial={ss.get(1,0)}, Missing={ss.get(0,0)}")
-
-    # Create model
-    config = ModelConfig(
-        learning_rate=2e-5,
-        checkpoint_path=str(MODEL_CACHE_DIR / "hybrid_skill_matcher.pt")
-    )
-
-    model = HybridSkillMatcher(config)
-    model.to(device)
-
-    # Create datasets
-    train_dataset = SkillGapDataset(train_df, model)
-    val_dataset = SkillGapDataset(val_df, model)
-    test_dataset = SkillGapDataset(test_df, model)
-
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
-
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-
-    # Compute class weights from training data
-    from sklearn.utils.class_weight import compute_class_weight
-    import numpy as np
-    all_train_labels = train_df['skill_status'].values
-    class_weights_arr = compute_class_weight('balanced', classes=np.unique(all_train_labels), y=all_train_labels)
-    class_weights_tensor = torch.tensor(class_weights_arr, dtype=torch.float32).to(device)
-
-    # Training loop
-    n_epochs = config.epochs
-    best_val_f1 = 0.0
-    patience = getattr(config, 'patience', 3)
-    patience_counter = 0
-
-    # Track validation probabilities and labels for threshold optimization
-    val_probabilities_all = []
-    val_labels_all = []
-
-    print(f"\nStarting training for {n_epochs} epochs...")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-
-    for epoch in range(1, n_epochs + 1):
-        print(f"\nEpoch {epoch}/{n_epochs}")
-
-        # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, class_weights_tensor, config)
-
-        # Evaluate - collect probabilities and labels
-        model.eval()
-        val_preds = []
-        val_labels_ep = []
-        val_probs_ep = []
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                         for k, v in batch.items()}
-                fused_outputs = []
-                for features in batch["features"]:
-                    feature_vec = torch.cat([v for v in features.values()], dim=0)
-                    fused = model.feature_fusion({"similarity": feature_vec[0],
-                                                 "keyword": feature_vec[1],
-                                                 "ontology": feature_vec[2],
-                                                 "importance": feature_vec[3],
-                                                 "occupation": feature_vec[4]})
-                    logit = model.classifier(fused)
-                    fused_outputs.append(logit)
-                fused_logits = torch.stack(fused_outputs)
-                probabilities = torch.softmax(fused_logits, dim=-1)
-                predictions = torch.argmax(probabilities, dim=-1).cpu().numpy()
-                val_preds.extend(predictions.tolist())
-                val_labels_ep.extend(batch["labels"].cpu().numpy().tolist())
-                val_probs_ep.extend(probabilities.cpu().numpy().tolist())
-
-        # Compute validation metrics
-        val_accuracy = float(np.mean(np.array(val_preds) == np.array(val_labels_ep)))
-        precision, recall, f1, support = precision_recall_fscore_support(
-            val_labels_ep, val_preds, average=None, labels=[0, 1, 2]
-        )
-        val_macro_f1 = float(f1_score(val_labels_ep, val_preds, average='macro'))
-        val_weighted_f1 = float(f1_score(val_labels_ep, val_preds, average='weighted'))
-
-        # Store for threshold optimization
-        val_probabilities_all.extend(val_probs_ep)
-        val_labels_all.extend(val_labels_ep)
-
-        print(f"Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}, "
-              f"Macro F1: {train_metrics['macro_f1']:.4f}")
-        print(f"Val   - Acc: {val_accuracy:.4f}, Macro F1: {val_macro_f1:.4f}")
-
-        # Save best model
-        if val_macro_f1 > best_val_f1:
-            best_val_f1 = val_macro_f1
-            patience_counter = 0
-            model.save(config.checkpoint_path)
-            print(f"  -> New best model saved (val Macro F1: {best_val_f1:.4f})")
+    started = time.monotonic()
+    frames, input_hashes = load_splits(args.processed_dir)
+    severity_supported = False
+    if "gap_severity" in frames["train"]:
+        labels = frames["train"].gap_severity.astype(str).str.casefold()
+        severity_supported = labels[labels.isin(SEVERITY_NAMES)].nunique() >= 2
+    config = ModelConfig(hidden_dim=args.hidden_dim, epochs=args.epochs, patience=args.patience,
+                         learning_rate=args.learning_rate, batch_size=args.batch_size,
+                         severity_enabled=severity_supported,
+                         checkpoint_path=str(run_dir / "best_model.pt"))
+    print(f"Device: {device}; frozen encoder; severity head enabled: {severity_supported}", flush=True)
+    model = HybridSkillMatcher(config, encoder_path=args.encoder_path).to(device)
+    fingerprint = model.encoder_fingerprint()
+    cache_dir = args.output_dir / "embedding_cache"
+    # Frozen unsupervised encoding of all inputs fits no parameters on val/test.
+    resume_texts = set().union(*(set(d.resume_text) for d in frames.values()))
+    skill_texts = set().union(*(set(d.required_skills_raw) for d in frames.values()))
+    rtable, rindex, rpath = cached_embeddings(model, resume_texts, "resume", cache_dir,
+                                             fingerprint, args.encoder_batch_size)
+    stable, sindex, spath = cached_embeddings(model, skill_texts, "skill", cache_dir,
+                                             fingerprint, args.encoder_batch_size)
+    datasets = {s: SkillGapDataset(d, rtable, rindex, stable, sindex) for s, d in frames.items()}
+    generator = torch.Generator().manual_seed(args.seed)
+    loaders = {s: DataLoader(d, batch_size=args.batch_size, shuffle=s == "train",
+                            num_workers=args.workers, pin_memory=device.type == "cuda",
+                            generator=generator if s == "train" else None, drop_last=False)
+               for s, d in datasets.items()}
+    run_dir.mkdir(parents=True)
+    smoke = smoke_check(model, loaders["train"], device, run_dir / "smoke_model.pt")
+    if args.smoke_test:
+        (run_dir / "smoke_results.json").write_text(json.dumps(smoke, indent=2), encoding="utf-8")
+        return
+    counts = torch.bincount(datasets["train"].labels, minlength=3).float()
+    if (counts == 0).any():
+        raise ValueError("A training class is absent; cannot train this three-class baseline")
+    weights = (counts.sum() / (3 * counts)).pow(args.class_weight_power)
+    weights = weights / weights.mean()
+    criterion = nn.CrossEntropyLoss(weight=weights.to(device))
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                 lr=config.learning_rate, weight_decay=config.weight_decay)
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}; "
+          f"class weights: {weights.tolist()}", flush=True)
+    print("EXPERIMENTAL: tiny Partial support; class weights cannot provide class diversity.", flush=True)
+    history, best, best_epoch, stale = [], -1., 0, 0
+    for epoch in range(1, args.epochs + 1):
+        epoch_started = time.monotonic()
+        loss = train_epoch(model, loaders["train"], optimizer, criterion, device)
+        validation = evaluate_model(model, loaders["val"], device)
+        history.append({"epoch": epoch, "weighted_loss": loss, "validation": validation,
+                        "seconds": time.monotonic() - epoch_started})
+        print(f"Epoch {epoch}/{args.epochs}: loss={loss:.5f} "
+              f"val accuracy={validation['accuracy']:.4f} macro-F1={validation['macro_f1']:.4f} "
+              f"Partial F1={validation['per_class']['partial']['f1']:.4f} "
+              f"({time.monotonic() - epoch_started:.1f}s)", flush=True)
+        if validation["macro_f1"] > best + 1e-6:
+            best, best_epoch, stale = validation["macro_f1"], epoch, 0
+            model.save(config.checkpoint_path, {"epoch": epoch, "validation": validation,
+                       "class_counts": counts.long().tolist(), "class_weights": weights.tolist(),
+                       "class_weight_power": args.class_weight_power, "encoder_fingerprint": fingerprint,
+                       "seed": args.seed, "input_sha256": input_hashes, "experimental": True})
         else:
-            patience_counter += 1
-            print(f"  -> No improvement. Patience: {patience_counter}/{patience}")
-
-        if patience_counter >= patience:
-            print(f"Early stopping after {epoch} epochs")
+            stale += 1
+        if stale >= args.patience:
+            print(f"Early stopping: {stale} epochs without validation improvement", flush=True)
             break
-
-    # Compute optimal thresholds from all validation predictions
-    val_probs_arr = np.array(val_probabilities_all)
-    val_labels_arr = np.array(val_labels_all)
-    optimal_thresholds = compute_optimal_thresholds(val_probs_arr, val_labels_arr)
-    print(f"\nOptimal thresholds: {optimal_thresholds}")
-
-    # Final evaluation on test set with optimized thresholds
-    print(f"\n=== Final evaluation on test set ===")
-    
-    # Evaluate test set with optimized thresholds
-    model.eval()
-    test_preds = []
-    test_labels = []
-    test_probs = []
+    best_model = HybridSkillMatcher.load(config.checkpoint_path, device)
+    validation = evaluate_model(best_model, loaders["val"], device)
+    if abs(validation["macro_f1"] - best) > 1e-8:
+        raise AssertionError("Reloaded best checkpoint validation differs from selection metric")
+    test = None if args.skip_test else evaluate_model(best_model, loaders["test"], device)
+    first = frames["val"].iloc[0]
+    prediction = best_model.predict(first.resume_text, first.required_skills_raw, float(first.skill_importance))
+    sample = datasets["val"][0]
     with torch.no_grad():
-        for batch in test_loader:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
-            fused_outputs = []
-            for features in batch["features"]:
-                # features is a tensor of shape [5] = [similarity, keyword, ontology, importance, occupation]
-                sim = features[0].item()
-                kw = features[1].item()
-                ont = features[2].item()
-                imp = features[3].item()
-                occ = features[4].item()
-                
-                fused = model.feature_fusion({"similarity": torch.tensor(sim, device=device, dtype=torch.float32),
-                                             "keyword": torch.tensor(kw, device=device, dtype=torch.float32),
-                                             "ontology": torch.tensor(ont, device=device, dtype=torch.float32),
-                                             "importance": torch.tensor(imp, device=device, dtype=torch.float32),
-                                             "occupation": torch.tensor(occ, device=device, dtype=torch.float32)})
-                logit = model.classifier(fused)
-                fused_outputs.append(logit)
-            fused_logits = torch.stack(fused_outputs)
-            probabilities = torch.softmax(fused_logits, dim=-1).cpu().numpy()
-            # Apply optimized thresholds: for each sample, determine predicted class
-            for i, prob in enumerate(probabilities):
-                # Class probabilities: prob[0]=missing, prob[1]=partial, prob[2]=present
-                # Use thresholds: if prob[2] >= present_thresh -> present
-                #                elif prob[1] >= partial_thresh -> partial
-                #                else -> missing
-                p_present = prob[2]
-                p_partial = prob[1]
-                p_missing = prob[0]
-                
-                if p_present >= optimal_thresholds["present"]:
-                    pred = 2
-                elif p_partial >= optimal_thresholds["partial"]:
-                    pred = 1
-                else:
-                    pred = 0
-                test_preds.append(pred)
-                test_probs.append(prob[i].tolist())
-            test_labels.extend(batch["labels"].cpu().numpy().tolist())
-
-    # Compute metrics
-    accuracy = float(np.mean(np.array(test_preds) == np.array(test_labels)))
-
-    # Per-class metrics
-    precision, recall, f1, support = precision_recall_fscore_support(
-        test_labels, test_preds, average=None, labels=[0, 1, 2]
-    )
-
-    macro_f1 = float(f1_score(test_labels, test_preds, average='macro'))
-    weighted_f1 = float(f1_score(test_labels, test_preds, average='weighted'))
-
-    per_class = {
-        "class_0_missing": {"precision": float(precision[0]), "recall": float(recall[0]),
-                            "f1": float(f1[0]), "support": int(support[0])},
-        "class_1_partial": {"precision": float(precision[1]), "recall": float(recall[1]),
-                           "f1": float(f1[1]), "support": int(support[1])},
-        "class_2_present": {"precision": float(precision[2]), "recall": float(recall[2]),
-                            "f1": float(f1[2]), "support": int(support[2])},
-    }
-
-    print(f"Test - Accuracy: {accuracy:.4f}")
-    print(f"Test - Macro F1: {macro_f1:.4f}")
-    print(f"Test - Weighted F1: {weighted_f1:.4f}")
-
-    for class_name, met in per_class.items():
-        print(f"Test - {class_name}: P={met['precision']:.3f}, R={met['recall']:.3f}, "
-              f"F1={met['f1']:.3f}, Support={met['support']}")
-
-    # Save training config and results
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-
+        cached_prediction = best_model(**{k: sample[k].unsqueeze(0).to(device)
+                                          for k in ("resume_embeddings", "skill_embeddings", "features")})
+    torch.testing.assert_close(torch.tensor(prediction["logits"]),
+                               cached_prediction["logits"][0].cpu(), atol=2e-5, rtol=2e-4)
+    if any(file_hash(p) != h for p, h in input_hashes.items()):
+        raise AssertionError("A source dataset changed during training")
     results = {
-        "config": config.__dict__,
-        "test_metrics": test_metrics,
-        "train_samples": len(train_df),
-        "val_samples": len(val_df),
-        "test_samples": len(test_df),
-        "timestamp": datetime.now().isoformat(),
-        "random_seed": 42,
+        "experimental": True, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "config": asdict(config), "arguments": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
+        "device": str(device), "torch_version": str(torch.__version__), "seed": args.seed,
+        "class_counts": counts.long().tolist(), "class_weights": weights.tolist(),
+        "class_weighting": "inverse frequency raised to class_weight_power, normalized",
+        "rows_used": {s: len(d) for s,d in datasets.items()}, "rows_dropped": 0,
+        "embedding_caches": [rpath, spath], "encoder_fingerprint": fingerprint,
+        "severity_head_enabled": severity_supported,
+        "severity_note": "Disabled without supported severity labels; no severity targets synthesized.",
+        "best_epoch": best_epoch, "best_validation_macro_f1": best,
+        "validation_metrics": validation, "test_metrics": test, "history": history,
+        "smoke_test": smoke, "checkpoint": config.checkpoint_path,
+        "checkpoint_reload_verified": True, "raw_and_cached_inference_verified": True,
+        "inference_example": prediction, "input_sha256": input_hashes,
+        "original_datasets_unchanged": True, "seconds": time.monotonic() - started,
+        "limitations": [
+            "Weak-label agreement, not human-validated competence.",
+            "Only 28 train / 6 validation / 7 test Partial rows; class weighting cannot fix missing diversity.",
+            "Validation macro-F1 selection is unstable with only six Partial examples.",
+            "Jobs and skill concepts are shared across resume-isolated splits.",
+            "Resume chunks are pooled; the encoder is frozen and may truncate individual long-token chunks.",
+            "Probabilities are not calibrated; production analyzer integration is not part of this experiment.",
+        ],
     }
-
-    with open(REPORTS_DIR / "training_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"\nTraining results saved to REPORTS_DIR / training_results.json")
-    print(f"Best model: {config.checkpoint_path}")
-    print(f"Best val Macro F1: {best_val_f1:.4f}")
-
-    return model, results
+    (run_dir / "training_results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    print("COMPLETED", json.dumps({"best_epoch": best_epoch, "validation": validation,
+                                   "test": test, "seconds": results["seconds"],
+                                   "checkpoint": config.checkpoint_path}), flush=True)
 
 
 if __name__ == "__main__":
-    model, results = main()
+    main()
